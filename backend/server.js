@@ -54,6 +54,17 @@ db.exec(`
   )
 `);
 
+db.exec(`
+  CREATE TABLE IF NOT EXISTS leads (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    nom TEXT NOT NULL,
+    telephone TEXT NOT NULL,
+    motif TEXT,
+    situation TEXT,
+    created_at INTEGER NOT NULL
+  )
+`);
+
 /* ---------------------------------------------------------------
    Logique métier de la checklist (identique à celle du frontend —
    c'est le serveur qui fait foi désormais)
@@ -214,9 +225,23 @@ app.post("/api/dossiers", (req, res) => {
 });
 
 // Retrouver un dossier par référence (le client fournit sa propre référence)
+// Normalise un numéro pour comparaison (retire espaces/tirets/indicatif)
+function normalizePhone(p) {
+  return (p || "").replace(/[^0-9]/g, "").slice(-9);
+}
+
 app.get("/api/dossiers/:ref", (req, res) => {
   const row = db.prepare("SELECT * FROM dossiers WHERE ref = ?").get(req.params.ref.toUpperCase());
   if (!row) return res.status(404).json({ error: "Dossier introuvable." });
+
+  const isAgence = req.header("x-agence-pin") === process.env.AGENCE_PIN;
+  if (!isAgence) {
+    const given = normalizePhone(req.query.telephone);
+    const expected = normalizePhone(row.telephone);
+    if (!given || !expected || given !== expected) {
+      return res.status(403).json({ error: "Le numéro de téléphone ne correspond pas à ce dossier." });
+    }
+  }
   res.json(rowToDossier(row));
 });
 
@@ -233,10 +258,17 @@ app.patch("/api/dossiers/:ref", (req, res) => {
   if (!row) return res.status(404).json({ error: "Dossier introuvable." });
 
   const isAgence = req.header("x-agence-pin") === process.env.AGENCE_PIN;
-  const { documents, notes, status, decision } = req.body;
+  const { documents, notes, status, decision, telephone } = req.body;
 
   if ((status || decision !== undefined) && !isAgence) {
     return res.status(401).json({ error: "Seule l'agence peut modifier le statut du dossier." });
+  }
+  if (!isAgence) {
+    const given = normalizePhone(telephone);
+    const expected = normalizePhone(row.telephone);
+    if (!given || !expected || given !== expected) {
+      return res.status(403).json({ error: "Le numéro de téléphone ne correspond pas à ce dossier." });
+    }
   }
 
   const next = {
@@ -252,6 +284,16 @@ app.patch("/api/dossiers/:ref", (req, res) => {
 
   const updated = db.prepare("SELECT * FROM dossiers WHERE ref = ?").get(ref);
   res.json(rowToDossier(updated));
+});
+
+// Suppression d'un dossier — réservée à l'agence
+app.delete("/api/dossiers/:ref", requireAgencePin, (req, res) => {
+  const ref = req.params.ref.toUpperCase();
+  const row = db.prepare("SELECT * FROM dossiers WHERE ref = ?").get(ref);
+  if (!row) return res.status(404).json({ error: "Dossier introuvable." });
+  db.prepare("DELETE FROM dossiers WHERE ref = ?").run(ref);
+  db.prepare("DELETE FROM reviews WHERE dossier_ref = ?").run(ref);
+  res.json({ ok: true });
 });
 
 /* ---------------------------------------------------------------
@@ -399,6 +441,35 @@ app.get("/api/reviews/:ref", (req, res) => {
 });
 
 /* ---------------------------------------------------------------
+   Prospects — capturés via l'outil gratuit de liste de documents.
+   La checklist est renvoyée immédiatement pour un affichage sans
+   étape supplémentaire côté client.
+---------------------------------------------------------------- */
+app.post("/api/leads", (req, res) => {
+  const { nom, telephone, motif, situation } = req.body;
+  if (!nom || !telephone || !motif || !situation) {
+    return res.status(400).json({ error: "nom, telephone, motif et situation sont requis." });
+  }
+  db.prepare(
+    `INSERT INTO leads (nom, telephone, motif, situation, created_at) VALUES (?, ?, ?, ?, ?)`
+  ).run(nom, telephone, motif, situation, Date.now());
+
+  const documents = buildChecklist(motif, situation);
+  res.status(201).json({ documents });
+});
+
+// Liste des prospects — réservée à l'agence
+app.get("/api/leads", requireAgencePin, (req, res) => {
+  const rows = db.prepare("SELECT * FROM leads ORDER BY created_at DESC").all();
+  res.json(rows);
+});
+
+app.delete("/api/leads/:id", requireAgencePin, (req, res) => {
+  db.prepare("DELETE FROM leads WHERE id = ?").run(req.params.id);
+  res.json({ ok: true });
+});
+
+/* ---------------------------------------------------------------
    Statistiques — tableau de bord agence
 ---------------------------------------------------------------- */
 app.get("/api/stats", requireAgencePin, (req, res) => {
@@ -416,8 +487,9 @@ app.get("/api/stats", requireAgencePin, (req, res) => {
   }, {});
   const avis = db.prepare("SELECT note FROM reviews").all();
   const noteMoyenne = avis.length ? avis.reduce((s, a) => s + a.note, 0) / avis.length : null;
+  const nbProspects = db.prepare("SELECT COUNT(*) as c FROM leads").get().c;
 
-  res.json({ total, payes, enAttente, revenu, parStatut, nbAvis: avis.length, noteMoyenne });
+  res.json({ total, payes, enAttente, revenu, parStatut, nbAvis: avis.length, noteMoyenne, nbProspects });
 });
 
 const PORT = process.env.PORT || 3001;
